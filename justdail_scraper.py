@@ -191,7 +191,7 @@ class JustdialScraper:
 
             product_data = {
                 "product_title": title,
-                "name": "NA",
+                "name": anchor_tag.text,
                 "rating": rating,
                 "address": address,
                 "phone": phone,
@@ -210,7 +210,7 @@ class JustdialScraper:
 
     def get_phone_number(self, product):
         """Extract phone number from product (preserve original DOM interactions)."""
-        self.random_delay()
+        self.random_delay(2,3)
         try:
             phone_button = product.find_element(By.CSS_SELECTOR, '[class*="greenfill_animate"]')
             button_text = phone_button.text.strip()
@@ -223,26 +223,31 @@ class JustdialScraper:
                 self.random_delay()
 
                 # original used a driver-level XPath to fetch the contact number
-                try:
-                    phone_elem = self.driver.find_element(
-                        By.XPATH, '//div[text()="Contact Information"]/following-sibling::div[1]'
-                    )
-                    phone = phone_elem.text.strip()
-                except Exception:
-                    phone = "N/A"
-
-                # attempt to close popup using selectors from original code
-                close_selectors = ['div[class*="jdmart_modal_close"]:nth-of-type(1)', 'div[class*="jd_modal_close"]']
-                for locator in close_selectors:
+                phone = "N/A"
+                phone_locators = {By.ID: "listing_call_button", By.XPATH: '//div[text()="Contact Information"]/following-sibling::div[1]'}
+                for selector, locator in phone_locators.items():
                     try:
-                        close_button = self.driver.find_element(By.CSS_SELECTOR, locator)
-                        try:
-                            close_button.click()
-                        except Exception:
-                            pass
+                        phone_elem = self.driver.find_element(
+                           selector, locator
+                        )
+                        phone = phone_elem.text.strip()
                         break
                     except NoSuchElementException:
                         continue
+
+                # attempt to close popup using selectors from original code
+                if selector == "xpath":
+                    close_selectors = ['div[class*="jdmart_modal_close"]:nth-of-type(1)', 'div[class*="jd_modal_close"]']
+                    for locator in close_selectors:
+                        try:
+                            close_button = self.driver.find_element(By.CSS_SELECTOR, locator)
+                            try:
+                                close_button.click()
+                            except Exception:
+                                pass
+                            break
+                        except NoSuchElementException:
+                            continue
 
                 self.random_delay(0.5, 1.0)
             else:
@@ -289,6 +294,13 @@ class JustdialScraper:
                 # Process newly discovered products (original sliced by last_count)
                 try:
                     for product in products[last_count:]:
+                        # check if there is any login popup
+                        try:
+                            self.driver.find_element(By.ID, "login-modal-title")
+                            raise Exception("There is a login popup, which cannot be bypassed. Please retry..")
+                        except NoSuchElementException:
+                            pass
+
                         details = self.get_product_details(product, url)
                         if details:
                             details["product_index"] = len(products_data) + 1
