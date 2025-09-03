@@ -1,44 +1,30 @@
-import logging
+"""
+Justdial WhatsApp Scraper (new approach)
+- Reuses Chrome profile to avoid repeated login
+- Injects JS hook to capture API paginated data (docid + scd)
+- Smooth-scrolls using provided smooth_scroll() method until all docids are collected
+- For each (docid, scd) constructs cwaxp url and resolves redirect to get final WhatsApp number
+- Saves data to an .xlsx file
+"""
+import os.path
 import time
+import json
+import re
 import random
+import logging
 from datetime import datetime
-from typing import List, Optional, Dict
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
-import undetected_chromedriver as uc_orig
+import requests
+
+from selenium.common.exceptions import WebDriverException
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.common.action_chains import ActionChains
-from selenium.common.exceptions import (
-    NoSuchElementException,
-    WebDriverException,
-)
+
+from undetected_chromedriver import Chrome
+from selenium.webdriver import ChromeOptions
 
 
-class Chrome(uc_orig.Chrome):
-    def __init__(self, **kwargs):
-        # Keep constructor signature and behavior same as original
-        super().__init__(**kwargs)
-
-    def __del__(self):
-        # Suppress destructor exceptions like original
-        try:
-            if hasattr(self, "service") and getattr(self.service, "process", None):
-                try:
-                    self.service.process.kill()
-                except Exception:
-                    pass
-            try:
-                self.quit()
-            except Exception:
-                pass
-        except Exception:
-            pass
-
-
-# ----------------------------
-# Logging config (preserve filename)
-# ----------------------------
 LOGFILE = "scraper.log"
 logging.basicConfig(
     filename=LOGFILE,
@@ -46,381 +32,425 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+logger.addHandler(console)
 
 
-# ----------------------------
-# Main scraper
-# ----------------------------
-class JustdialScraper:
-    def __init__(self, chunk_size: int = 50):
-        """
-        chunk_size: how many records to accumulate before writing a partial file (to avoid total data loss)
-        """
-        self.driver = None
-        self.wait = None
-        self.action = None
-        self.chunk_size = max(1, int(chunk_size))
-        self._partial_save_counter = 0  # internal counter for naming partial files
-        self.setup_driver()
+# -------------------------
+# Configuration
+# -------------------------
+INPUT_FILE = "justdial_urls.txt"          # corrected filename (you said correct typo)
+OUTPUT_XLSX = f"justdial_whatsapp_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+CHROME_PROFILE_DIR = os.path.join(os.getcwd(), "chrome_profiless")  # change if you want to reuse a specific profile
+WAIT_FOR_LOGIN_SECONDS = 300              # how long to wait for user to login (0 => exit immediately if not logged in)
+SCROLL_PAUSE = 1.5                        # pause between scrolls
+MAX_SCROLLS = 200                         # safety cap
+RESOLVE_DELAY = (0.25, 0.6)               # random sleep between resolving cwaxp links (avoid rate-limit)
+FETCH_TIMEOUT = 15                        # seconds for JS fetch fallback timeouts
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
 
-    def setup_driver(self):
-        """Initialize Chrome driver with appropriate options."""
+
+# -------------------------
+# Helper: Create driver
+# -------------------------
+def create_driver(profile_dir: str, headless: bool = False):
+    """Create a Chrome driver, reusing the given profile folder. Prefer undetected_chromedriver if available."""
+    chrome_options = ChromeOptions()
+    chrome_options.add_argument('--user-data-dir=' + CHROME_PROFILE_DIR)
+    chrome_options.add_argument("--disable-notifications")
+    chrome_options.add_argument("--disable-popup-blocking")
+    driver = Chrome(options=chrome_options)
+    driver.maximize_window()
+    return driver
+
+# -------------------------
+# Smooth scroll (your exact function)
+# -------------------------
+def smooth_scroll(driver, pixels: int):
+    """Perform smooth scrolling (preserve original stepping and delays)."""
+    if not isinstance(pixels, int) or pixels <= 0:
+        return
+    current = 0
+    step = 50
+    while current < pixels:
+        scroll_amount = min(step, pixels - current)
         try:
-            self.driver = Chrome(use_subprocess=False)
-            # maximize_window can fail in headless/no-display env; guard it
-            try:
-                self.driver.maximize_window()
-            except Exception:
-                logger.debug("Couldn't maximize window (environment may not support it).")
-            self.wait = WebDriverWait(self.driver, 15)  # 15s timeout like original
-            self.action = ActionChains(self.driver)
-            logger.info("Browser initialized successfully")
-        except Exception as e:
-            logger.exception("Failed to initialize browser.")
-            raise
+            driver.execute_script(f"window.scrollBy(0, {scroll_amount});")
+        except WebDriverException:
+            logger.debug("execute_script failed while scrolling.")
+            break
+        current += scroll_amount
+        time.sleep(random.uniform(0.1, 0.2))
 
-    def validate_url(self, url: str) -> bool:
-        """Validate if the URL is a valid Justdial URL (same logic as original)."""
-        if not isinstance(url, str):
-            return False
-        return "justdial.com" in url.lower() and url.startswith(("http://", "https://"))
 
-    def read_urls(self, filename: str) -> List[str]:
-        """Read and validate URLs from the input file. Behavior preserved (creates sample file if missing)."""
-        valid_urls: List[str] = []
-        try:
-            with open(filename, "r", encoding="utf-8") as f:
-                for line_num, line in enumerate(f, 1):
-                    url = line.strip()
-                    if not url or url.startswith("#"):
-                        continue
-                    if self.validate_url(url):
-                        valid_urls.append(url)
-                    else:
-                        logger.warning(f"Invalid URL skipped at line {line_num}: {url}")
-        except FileNotFoundError:
-            logger.error(f"Input file {filename} not found.")
-            # Create sample file (preserve original sample content)
-            try:
-                with open(filename, "w", encoding="utf-8") as f:
-                    f.write("# Add one Justdial URL per line\n")
-                    f.write("# Example: https://www.justdial.com/Mumbai/Restaurants\n")
-                logger.info(f"Created sample {filename} file. Please add URLs and run again.")
-            except Exception:
-                logger.exception("Failed to create sample input file.")
-        except Exception:
-            logger.exception("Unexpected error while reading URLs.")
-        return valid_urls
+# -------------------------
+# JS hook injector
+# -------------------------
+HOOK_JS = r"""
+(function() {
+    if (window.jdHookInstalled) return;
+    window.jdHookInstalled = true;
+    window.jdWhatsappsMap = window.jdWhatsappsMap || {}; // { docid: scd }
 
-    def smooth_scroll(self, pixels: int):
-        """Perform smooth scrolling (preserve original stepping and delays)."""
-        if not isinstance(pixels, int) or pixels <= 0:
-            return
-        current = 0
-        step = 50
-        while current < pixels:
-            scroll_amount = min(step, pixels - current)
-            try:
-                self.driver.execute_script(f"window.scrollBy(0, {scroll_amount});")
-            except WebDriverException:
-                # If script execution fails, exit gracefully
-                logger.debug("execute_script failed while scrolling.")
-                break
-            current += scroll_amount
-            time.sleep(random.uniform(0.1, 0.2))
+    function seedFromNextData() {
+        try {
+            const nd = document.getElementById("__NEXT_DATA__");
+            if (!nd || !nd.textContent) return;
+            const data = JSON.parse(nd.textContent);
+            const results = data?.props?.pageProps?.listData?.results;
+            if (!results) return;
+            const cols = results.columns || [];
+            const docidIndex = cols.indexOf("docid");
+            const scdIndex = cols.indexOf("scd");
+            if (docidIndex === -1 || scdIndex === -1) return;
+            (results.data || []).forEach(row => {
+                const docid = row[docidIndex];
+                const scd = row[scdIndex];
+                if (docid && scd) {
+                    window.jdWhatsappsMap[docid] = scd;
+                }
+            });
+        } catch (e) {
+            // ignore parse errors
+        }
+    }
 
-    def random_delay(self, min_seconds: float = 1.0, max_seconds: float = 3.0):
-        """Random delay helper (same behavior as original)."""
-        try:
-            if min_seconds < 0:
-                min_seconds = 0
-            if max_seconds < min_seconds:
-                max_seconds = min_seconds
-            time.sleep(random.uniform(min_seconds, max_seconds))
-        except Exception:
-            # If time.sleep fails for some reason, ignore; not critical
-            logger.debug("random_delay failed, ignoring.")
+    // seed initial page data immediately
+    seedFromNextData();
 
-    # commented original popup handler kept commented to preserve code visibility
-    # def handle_popup(self):
-    #     ...
-
-    def check_and_close_deal_popup(self):
-        """Find and close the Justdial 'best deal' popup if present (preserve original behavior)."""
-        try:
-            best_deal = self.driver.find_element(By.CSS_SELECTOR, 'div[class*="bestdeal_right"]')
-        except NoSuchElementException:
-            return
-        except Exception:
-            # Any other issue — we don't want this to crash scraping
-            logger.debug("Unexpected error while locating bestdeal element (ignored).")
-            return
-
-        try:
-            close_button = best_deal.find_element(By.CSS_SELECTOR, '[aria-label="Best deal Modal Close Icon"]')
-            close_button.click()
-            logger.info("Closed popup window.")
-            # original waited between 2-4s after closing
-            self.random_delay(2, 4)
-        except Exception:
-            logger.debug("Failed to close popup (possibly already closed).")
-
-    def get_product_details(self, product, url: str) -> Optional[Dict]:
-        """
-        Extract details from a product element.
-        Signature kept identical to original (product, url) even though original overwrote url.
-        """
-        try:
-            # Extract title anchor
-            anchor_tag = product.find_element(By.CSS_SELECTOR, 'a[class*="resultbox_title_anchorbox"]')
-
-            # original code got href & title from anchor_tag and rating/address from product
-            product_url = anchor_tag.get_attribute("href")
-            title = anchor_tag.get_attribute("title") or ""
-            try:
-                rating = product.find_element(By.CSS_SELECTOR, 'li[class*="resultbox_totalrate"]').text.strip()
-            except NoSuchElementException:
-                rating = ""
-            try:
-                address = product.find_element(By.TAG_NAME, "address").text.strip()
-            except NoSuchElementException:
-                address = ""
-
-            # Get phone number (may involve clicking)
-            phone = self.get_phone_number(product)
-
-            product_data = {
-                "product_title": title,
-                "name": anchor_tag.text,
-                "rating": rating,
-                "address": address,
-                "phone": phone,
-                "url": product_url,
-                "scraped_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    // patch fetch
+    const origFetch = window.fetch;
+    window.fetch = async function(...args) {
+        const response = await origFetch.apply(this, args);
+        try {
+            const url = args[0] && args[0].toString ? args[0].toString() : "";
+            if (url.includes("/api/resultsPageListing")) {
+                // clone response and parse
+                const clone = response.clone();
+                clone.json().then(data => {
+                    try {
+                        const cols = data?.results?.columns || [];
+                        const docidIndex = cols.indexOf("docid");
+                        const scdIndex = cols.indexOf("scd");
+                        if (docidIndex !== -1 && scdIndex !== -1) {
+                            (data.results.data || []).forEach(row => {
+                                const docid = row[docidIndex];
+                                const scd = row[scdIndex];
+                                if (docid && scd) window.jdWhatsappsMap[docid] = scd;
+                            });
+                        }
+                    } catch(e){}
+                }).catch(()=>{});
             }
+        } catch(e){}
+        return response;
+    };
 
-            logger.info(f"Successfully scraped product: {title}")
-            return product_data
+    // patch XHR
+    const origOpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+        this.addEventListener("load", function() {
+            try {
+                if (url && url.includes("/api/resultsPageListing")) {
+                    const data = JSON.parse(this.responseText || "{}");
+                    const cols = data?.results?.columns || [];
+                    const docidIndex = cols.indexOf("docid");
+                    const scdIndex = cols.indexOf("scd");
+                    if (docidIndex !== -1 && scdIndex !== -1) {
+                        (data.results.data || []).forEach(row => {
+                            const docid = row[docidIndex];
+                            const scd = row[scdIndex];
+                            if (docid && scd) window.jdWhatsappsMap[docid] = scd;
+                        });
+                    }
+                }
+            } catch(e){}
+        });
+        return origOpen.call(this, method, url, ...rest);
+    };
 
-        except Exception as e:
-            # Mirror original behavior: check popup then log and return None
-            self.check_and_close_deal_popup()
-            logger.exception(f"Failed to extract product details: {e}")
-            return None
+    // expose helper to return collected entries as an array
+    window.getJDWhatsappsArray = function() {
+        const out = [];
+        for (const k in window.jdWhatsappsMap) {
+            out.push({docid: k, scd: window.jdWhatsappsMap[k]});
+        }
+        return out;
+    };
 
-    def get_phone_number(self, product):
-        """Extract phone number from product (preserve original DOM interactions)."""
-        self.random_delay(2,3)
-        try:
-            phone_button = product.find_element(By.CSS_SELECTOR, '[class*="greenfill_animate"]')
-            button_text = phone_button.text.strip()
-            if "Show Number" in button_text:
-                # Click the button and wait briefly for popup content
-                try:
-                    phone_button.click()
-                except Exception:
-                    logger.debug("Clicking phone button raised an exception (continuing).")
-                self.random_delay()
-
-                # original used a driver-level XPath to fetch the contact number
-                phone = "N/A"
-                phone_locators = {By.ID: "listing_call_button", By.XPATH: '//div[text()="Contact Information"]/following-sibling::div[1]'}
-                for selector, locator in phone_locators.items():
-                    try:
-                        phone_elem = self.driver.find_element(
-                           selector, locator
-                        )
-                        phone = phone_elem.text.strip()
-                        break
-                    except NoSuchElementException:
-                        continue
-
-                # attempt to close popup using selectors from original code
-                if selector == "xpath":
-                    close_selectors = ['div[class*="jdmart_modal_close"]:nth-of-type(1)', 'div[class*="jd_modal_close"]']
-                    for locator in close_selectors:
-                        try:
-                            close_button = self.driver.find_element(By.CSS_SELECTOR, locator)
-                            try:
-                                close_button.click()
-                            except Exception:
-                                pass
-                            break
-                        except NoSuchElementException:
-                            continue
-
-                self.random_delay(0.5, 1.0)
-            else:
-                phone = button_text or "N/A"
-
-            return phone
-        except NoSuchElementException:
-            # If there's no phone element, return N/A
-            logger.debug("Phone button not found for this product.")
-            return "N/A"
-        except Exception as e:
-            # preserve original pattern: check popup and return N/A
-            self.check_and_close_deal_popup()
-            logger.exception(f"Failed to get phone number: {e}")
-            return "N/A"
+})();
+"""
 
 
-    def scrape_products(self, url: str) -> List[Dict]:
-        """
-        Scrape products from a single URL.
-        Behavior kept consistent with original loop/termination logic.
-        """
-        products_data: List[Dict] = []
-        scroll_attempts = 0
-        max_scroll_attempts = 50
-        last_count = 0
+# -------------------------
+# Utility functions
+# -------------------------
+def read_urls(filename: str) -> List[str]:
+    urls = []
+    try:
+        with open(filename, "r", encoding="utf-8") as f:
+            for ln in f:
+                s = ln.strip()
+                if not s or s.startswith("#"):
+                    continue
+                if "justdial.com" in s.lower() and s.startswith(("http://", "https://")):
+                    urls.append(s)
+                else:
+                    logger.warning("Skipping invalid URL: %s", s)
+    except FileNotFoundError:
+        logger.error("Input file not found: %s", filename)
+        # create sample file
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write("# Put one Justdial search URL per line e.g.\n")
+            f.write("https://www.justdial.com/Thane/Supermarkets-in-Shanti-Nagar-Mira-Road-East/nct-10463784\n")
+        logger.info("Sample file created. Please add URLs and run again.")
+    return urls
 
-        try:
-            # Navigate to URL (original used driver.get and small delay)
-            self.driver.get(url)
-            self.random_delay()
-            logger.info(f"Started scraping URL: {url}")
 
-            while scroll_attempts < max_scroll_attempts:
-                # close popup if present
-                try:
-                    self.check_and_close_deal_popup()
-                except Exception:
-                    logger.debug("check_and_close_deal_popup raised exception (ignored).")
+def is_logged_in(driver) -> bool:
+    """Detect login via presence of known Justdial cookies (common keys)."""
+    try:
+        cookies = driver.get_cookies()
+        keys = {c["name"] for c in cookies}
+        # common Justdial cookie names we can accept as 'logged in'
+        check_keys = {"JDTID", "JDSID", "sid", "jd_sid", "JDINF"}
+        present = bool(keys & check_keys)
+        logger.debug("Cookies present: %s; login keys intersection: %s", keys, keys & check_keys)
+        return present
+    except Exception as e:
+        logger.exception("Error reading cookies to detect login: %s", e)
+        return False
 
-                products = self.driver.find_elements(By.CSS_SELECTOR, 'div[class*="resultbox_info"]')
-                current_count = len(products)
 
-                # Process newly discovered products (original sliced by last_count)
-                try:
-                    for product in products[last_count:]:
-                        # check if there is any login popup
-                        try:
-                            self.driver.find_element(By.ID, "login-modal-title")
-                            raise Exception("There is a login popup, which cannot be bypassed. Please retry..")
-                        except NoSuchElementException:
-                            pass
+def wait_for_login(driver, max_attempts: int = 3) -> bool:
+    """Wait for user to login manually in opened browser. Returns True if logged in, else False."""
 
-                        details = self.get_product_details(product, url)
-                        if details:
-                            details["product_index"] = len(products_data) + 1
-                            products_data.append(details)
+    if is_logged_in(driver):
+        logger.info("Detected login via cookies.")
+        return True
 
-                            # Partial save in chunks: this is an improvement but doesn't change core behavior
-                            if len(products_data) % self.chunk_size == 0:
-                                try:
-                                    self._partial_save_counter += 1
-                                    self._save_partial(products_data, url, self._partial_save_counter)
-                                except Exception:
-                                    logger.exception("Partial save failed; continuing scraping.")
-                except Exception as e:
-                    # keep consistent: check popup and log
-                    self.check_and_close_deal_popup()
-                    logger.exception(f"Exception while iterating products on page: {e}")
+    if max_attempts <= 0:
+        raise Exception("You need to login into Justdial, to extract the whatsapp numbers")
 
-                # Update last_count per original logic (note: original had a check that effectively breaks early.
-                # To preserve behavior we keep the same condition and update.)
-                if last_count == current_count:
-                    logger.info("Scrapped all the records..")
-                    break
+    input("Please login into JustDial and then press enter to continue. \n")
+    return wait_for_login(driver, max_attempts-1)
 
-                last_count = current_count
 
-                # Scroll down and wait as original did
-                self.smooth_scroll(800)
-                scroll_attempts += 1
+def parse_nextdocid_count_from_page(driver) -> int:
+    """Read __NEXT_DATA__ and return number of docids (split by comma)."""
+    try:
+        nd_text = driver.execute_script("return document.getElementById('__NEXT_DATA__') && document.getElementById('__NEXT_DATA__').textContent")
+        if not nd_text:
+            return 0
+        parsed = json.loads(nd_text)
+        nextdocid_str = parsed["props"]["pageProps"]["listData"].get("nextdocid", "") or ""
+        if nextdocid_str.strip() == "":
+            return 0
+        return len(nextdocid_str.split(","))
+    except Exception as e:
+        logger.exception("Failed to parse nextdocid from page: %s", e)
+        return 0
 
-                # small random delay as original
-                self.random_delay(2.0, 5.0)
-                # attempt close popup once more before next iteration
-                self.check_and_close_deal_popup()
 
-            logger.info(f"Completed scraping URL: {url}. Total products: {len(products_data)}")
+def get_collected_pairs(driver) -> List[Dict[str, str]]:
+    """Return array of {docid, scd} from browser hook (deduped)."""
+    try:
+        arr = driver.execute_script("return window.getJDWhatsappsArray ? window.getJDWhatsappsArray() : []")
+        # filter out entries missing scd
+        filtered = [x for x in arr if x.get("docid")]
+        return filtered
+    except Exception as e:
+        logger.exception("Error fetching collected pairs from browser: %s", e)
+        return []
 
-        except Exception as e:
-            # preserve original pattern: check popup and log error
-            try:
-                self.check_and_close_deal_popup()
-            except Exception:
-                logger.debug("check_and_close_deal_popup in exception path failed.")
-            logger.exception(f"Error scraping URL {url}: {e}")
 
-        return products_data
+def build_cwaxp_url(docid: str, scd: str) -> str:
+    return f"https://www.justdial.com/webmain/cwaxp.php?dd={docid}&wp={scd}"
 
-    def _save_partial(self, data: List[Dict], source_url: str, counter: int):
-        """
-        Save a partial chunk to an Excel file.
-        This is additive and shouldn't break original expectations.
-        Partial filenames include counter so they don't overwrite final export.
-        """
-        if not data:
+
+def extract_phone_from_url(wa_url: str) -> Optional[str]:
+    if not wa_url:
+        return None
+    # Try digits pattern (10-15 digits)
+    m = re.search(r"(\d{10,15})", wa_url)
+    if m:
+        return m.group(1)
+    # fallback: parse query param phone
+    try:
+        from urllib.parse import urlparse, parse_qs
+        parts = urlparse(wa_url)
+        q = parse_qs(parts.query)
+        for k in ("phone", "phoneNumber", "text"):
+            if k in q and q[k]:
+                m2 = re.search(r"(\d{10,15})", q[k][0])
+                if m2:
+                    return m2.group(1)
+    except Exception:
+        pass
+
+    return None
+
+
+def resolve_cwaxp_with_requests(url: str, cookies: Dict[str, str], headers: Dict[str, str]) -> Optional[str]:
+    """Fallback resolver using Python requests (no redirects)."""
+    try:
+        s = requests.Session()
+        s.headers.update(headers)
+        # set cookies
+        s.cookies.update(cookies)
+        r = s.get(url, allow_redirects=False, timeout=10)
+        if r.status_code in (301, 302, 307, 308):
+            return r.headers.get("Location")
+        # sometimes response is 200 with meta redirect - unlikely; return None
+        logger.debug("Requests resolver returned status %s for %s", r.status_code, url)
+        return None
+    except Exception as e:
+        logger.exception("resolve_cwaxp_with_requests failed: %s", e)
+        return None
+
+
+def driver_cookies_to_dict(driver) -> Dict[str, str]:
+    try:
+        return {c["name"]: c["value"] for c in driver.get_cookies()}
+    except Exception:
+        return {}
+
+
+# -------------------------
+# Main scraping logic
+# -------------------------
+def process_url(driver, url: str, wait_for_login_flag: bool = True) -> List[Dict]:
+    """Process a single Just dial listing/search URL and return enriched rows."""
+    logger.info("Processing: %s", url)
+    driver.get(url)
+    time.sleep(3)  # let initial resources load
+
+    # check login
+    if not is_logged_in(driver):
+        wait_for_login(driver)
+
+    # parse expected count from __NEXT_DATA__
+    expected = parse_nextdocid_count_from_page(driver)
+    if expected <= 0:
+        logger.warning("Could not parse expected docid count from page (nextdocid). Will use best-effort stopping.")
+    else:
+        logger.info("Found expected docid count = %d", expected)
+
+    # Inject hook
+    try:
+        driver.execute_script(HOOK_JS)
+    except Exception:
+        logger.exception("Failed to inject JS hook.")
+        return []
+
+    # smooth scroll loop using your smooth_scroll
+    collected = []
+    for i in range(MAX_SCROLLS):
+        smooth_scroll(driver, 600)  # 500px per iteration
+        time.sleep(SCROLL_PAUSE)
+
+        collected = get_collected_pairs(driver)
+        uniq_count = len({p['docid'] for p in collected})
+        logger.info("Scroll %d: collected %d unique pairs (expected %s)", i + 1, uniq_count, expected or "unknown")
+
+        if expected and uniq_count >= expected:
+            logger.info("Collected expected number of docids; stopping scroll.")
+            break
+
+    # final pull
+    collected = get_collected_pairs(driver)
+    # dedupe by docid (keep first)
+    dedup: Dict[str, str] = {}
+    for item in collected:
+        did = item.get("docid")
+        scd = item.get("scd")
+        if did and scd and did not in dedup:
+            dedup[did] = scd
+
+    logger.info("Total deduped pairs collected: %d", len(dedup))
+
+    # resolve each cwaxp url to whatsapp url and extract number
+    results = []
+    cookies = driver_cookies_to_dict(driver)
+    headers = {"User-Agent": USER_AGENT, "Referer": url, "Origin": "https://www.justdial.com"}
+
+    idx = 0
+    for docid, scd in dedup.items():
+        idx += 1
+        cwaxp = build_cwaxp_url(docid, scd)
+        logger.info("[%d/%d] Resolving cwaxp: %s", idx, len(dedup), cwaxp)
+
+        data = get_product_details(driver, docid)
+
+        wa_url = resolve_cwaxp_with_requests(cwaxp, cookies, headers)
+
+        data["phone"] = extract_phone_from_url(wa_url or "")
+        results.append(data)
+
+        time.sleep(random.uniform(*RESOLVE_DELAY))
+
+    return results
+
+
+def get_product_details(driver, doc_id):
+    product = driver.find_element(By.ID, doc_id)
+    anchor_tag = product.find_element(By.TAG_NAME, "a")
+    title = anchor_tag.get_attribute("title")
+    url = anchor_tag.get_attribute("href")
+    ratings = product.find_element(By.CSS_SELECTOR, "li[class*='resultbox_totalrate']").text
+    address = product.find_element(By.TAG_NAME, "address").text
+    return {
+        "title": title,
+        "url": url,
+        "ratings": ratings,
+        "address": address
+    }
+
+
+def save_to_excel(rows, is_partial: bool = False):
+    # Save to Excel
+    filename = OUTPUT_XLSX
+
+    df = pd.DataFrame(rows)
+    if is_partial:
+        filename = f"partial_{OUTPUT_XLSX}"
+
+    df.to_excel(filename)
+    logger.info("Saved output to %s", OUTPUT_XLSX)
+
+
+def main():
+    urls = read_urls(INPUT_FILE)
+    if not urls:
+        logger.error("No URLs to process. Please edit %s and add URLs.", INPUT_FILE)
+        return
+
+    driver = create_driver(CHROME_PROFILE_DIR, headless=False)
+    try:
+        # give browser time to fully initialize
+        time.sleep(2)
+        all_rows = []
+        for url in urls:
+            rows = process_url(driver, url, wait_for_login_flag=True)
+            all_rows.extend(rows)
+            save_to_excel(rows, is_partial=True)
+
+            # small pause between different search URLs
+            time.sleep(random.uniform(1.0, 2.5))
+
+        if not all_rows:
+            logger.warning("No data collected across all URLs.")
             return
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_name = "justdial_results_partial"
-        filename = f"{safe_name}_{counter}_{timestamp}.xlsx"
+        save_to_excel(all_rows)
+
+    finally:
         try:
-            df = pd.DataFrame(data)
-            columns = ["product_index", "product_title", "name", "rating", "address", "phone", "url", "scraped_at"]
-            df = df.reindex(columns=columns)
-            df.to_excel(filename, index=False)
-            logger.info(f"Partial data saved to {filename} (source: {source_url})")
+            driver.quit()
         except Exception:
-            logger.exception("Failed to save partial data to Excel.")
-
-    def save_to_excel(self, data: List[Dict]):
-        """
-        Save scraped data to Excel file with timestamp.
-        Kept signature and behavior compatible with original.
-        """
-        if not data:
-            logger.warning("No data to save to Excel")
-            return
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"justdial_results_{timestamp}.xlsx"
-
-        try:
-            df = pd.DataFrame(data)
-            columns = ["product_index", "product_title", "name", "rating", "address", "phone", "url", "scraped_at"]
-            df = df.reindex(columns=columns)
-            df.to_excel(filename, index=False)
-            logger.info(f"Data saved successfully to {filename}")
-        except Exception:
-            logger.exception("Error saving data to Excel.")
-
-    def run(self):
-        """Main method to run the scraper. Preserves original flow and filename usage."""
-        try:
-            urls = self.read_urls("justdail_urls.txt")  # keep original filename usage
-            if not urls:
-                logger.error("No valid URLs found in input file")
-                return
-
-            all_products: List[Dict] = []
-            for url in urls:
-                logger.info(f"Processing URL: {url}")
-                products = self.scrape_products(url)
-                all_products.extend(products)
-                # preserve original inter-URL delay behavior
-                self.random_delay(1.2, 2.8)
-
-            # final save (same as original)
-            self.save_to_excel(all_products)
-
-        except Exception as e:
-            logger.exception(f"Scraper failed: {e}")
-        finally:
-            if self.driver:
-                try:
-                    self.driver.quit()
-                except Exception:
-                    logger.debug("driver.quit() raised exception during cleanup.")
+            logger.debug("driver.quit() failed.")
 
 
 if __name__ == "__main__":
-    try:
-        scraper = JustdialScraper()
-        scraper.run()
-    except Exception:
-        logger.exception("Application error (fatal).")
+    main()
