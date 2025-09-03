@@ -6,6 +6,7 @@ Justdial WhatsApp Scraper (new approach)
 - For each (docid, scd) constructs cwaxp url and resolves redirect to get final WhatsApp number
 - Saves data to an .xlsx file
 """
+
 import os.path
 import time
 import json
@@ -13,7 +14,7 @@ import re
 import random
 import logging
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import pandas as pd
 import requests
@@ -40,14 +41,21 @@ logger.addHandler(console)
 # -------------------------
 # Configuration
 # -------------------------
-INPUT_FILE = "justdial_urls.txt"          # corrected filename (you said correct typo)
+INPUT_FILE = "justdial_urls.txt"  # corrected filename (you said correct typo)
 OUTPUT_XLSX = f"justdial_whatsapp_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-CHROME_PROFILE_DIR = os.path.join(os.getcwd(), "chrome_profiless")  # change if you want to reuse a specific profile
-WAIT_FOR_LOGIN_SECONDS = 300              # how long to wait for user to login (0 => exit immediately if not logged in)
-SCROLL_PAUSE = 1.5                        # pause between scrolls
-MAX_SCROLLS = 200                         # safety cap
-RESOLVE_DELAY = (0.25, 0.6)               # random sleep between resolving cwaxp links (avoid rate-limit)
-FETCH_TIMEOUT = 15                        # seconds for JS fetch fallback timeouts
+CHROME_PROFILE_DIR = os.path.join(
+    os.getcwd(), "chrome_profiless"
+)  # change if you want to reuse a specific profile
+WAIT_FOR_LOGIN_SECONDS = (
+    300  # how long to wait for user to login (0 => exit immediately if not logged in)
+)
+SCROLL_PAUSE = 1.5  # pause between scrolls
+MAX_SCROLLS = 200  # safety cap
+RESOLVE_DELAY = (
+    0.25,
+    0.6,
+)  # random sleep between resolving cwaxp links (avoid rate-limit)
+FETCH_TIMEOUT = 15  # seconds for JS fetch fallback timeouts
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
 
 
@@ -57,12 +65,13 @@ USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTM
 def create_driver(profile_dir: str, headless: bool = False):
     """Create a Chrome driver, reusing the given profile folder. Prefer undetected_chromedriver if available."""
     chrome_options = ChromeOptions()
-    chrome_options.add_argument('--user-data-dir=' + CHROME_PROFILE_DIR)
+    chrome_options.add_argument("--user-data-dir=" + CHROME_PROFILE_DIR)
     chrome_options.add_argument("--disable-notifications")
     chrome_options.add_argument("--disable-popup-blocking")
     driver = Chrome(options=chrome_options)
     driver.maximize_window()
     return driver
+
 
 # -------------------------
 # Smooth scroll (your exact function)
@@ -194,7 +203,9 @@ def read_urls(filename: str) -> List[str]:
                 s = ln.strip()
                 if not s or s.startswith("#"):
                     continue
-                if "justdial.com" in s.lower() and s.startswith(("http://", "https://")):
+                if "justdial.com" in s.lower() and s.startswith(
+                    ("http://", "https://")
+                ):
                     urls.append(s)
                 else:
                     logger.warning("Skipping invalid URL: %s", s)
@@ -203,7 +214,9 @@ def read_urls(filename: str) -> List[str]:
         # create sample file
         with open(filename, "w", encoding="utf-8") as f:
             f.write("# Put one Justdial search URL per line e.g.\n")
-            f.write("https://www.justdial.com/Thane/Supermarkets-in-Shanti-Nagar-Mira-Road-East/nct-10463784\n")
+            f.write(
+                "https://www.justdial.com/Thane/Supermarkets-in-Shanti-Nagar-Mira-Road-East/nct-10463784\n"
+            )
         logger.info("Sample file created. Please add URLs and run again.")
     return urls
 
@@ -216,7 +229,9 @@ def is_logged_in(driver) -> bool:
         # common Justdial cookie names we can accept as 'logged in'
         check_keys = {"JDTID", "JDSID", "sid", "jd_sid", "JDINF"}
         present = bool(keys & check_keys)
-        logger.debug("Cookies present: %s; login keys intersection: %s", keys, keys & check_keys)
+        logger.debug(
+            "Cookies present: %s; login keys intersection: %s", keys, keys & check_keys
+        )
         return present
     except Exception as e:
         logger.exception("Error reading cookies to detect login: %s", e)
@@ -231,20 +246,26 @@ def wait_for_login(driver, max_attempts: int = 3) -> bool:
         return True
 
     if max_attempts <= 0:
-        raise Exception("You need to login into Justdial, to extract the whatsapp numbers")
+        raise Exception(
+            "You need to login into Justdial, to extract the whatsapp numbers"
+        )
 
     input("Please login into JustDial and then press enter to continue. \n")
-    return wait_for_login(driver, max_attempts-1)
+    return wait_for_login(driver, max_attempts - 1)
 
 
 def parse_nextdocid_count_from_page(driver) -> int:
     """Read __NEXT_DATA__ and return number of docids (split by comma)."""
     try:
-        nd_text = driver.execute_script("return document.getElementById('__NEXT_DATA__') && document.getElementById('__NEXT_DATA__').textContent")
+        nd_text = driver.execute_script(
+            "return document.getElementById('__NEXT_DATA__') && document.getElementById('__NEXT_DATA__').textContent"
+        )
         if not nd_text:
             return 0
         parsed = json.loads(nd_text)
-        nextdocid_str = parsed["props"]["pageProps"]["listData"].get("nextdocid", "") or ""
+        nextdocid_str = (
+            parsed["props"]["pageProps"]["listData"].get("nextdocid", "") or ""
+        )
         if nextdocid_str.strip() == "":
             return 0
         return len(nextdocid_str.split(","))
@@ -256,7 +277,9 @@ def parse_nextdocid_count_from_page(driver) -> int:
 def get_collected_pairs(driver) -> List[Dict[str, str]]:
     """Return array of {docid, scd} from browser hook (deduped)."""
     try:
-        arr = driver.execute_script("return window.getJDWhatsappsArray ? window.getJDWhatsappsArray() : []")
+        arr = driver.execute_script(
+            "return window.getJDWhatsappsArray ? window.getJDWhatsappsArray() : []"
+        )
         # filter out entries missing scd
         filtered = [x for x in arr if x.get("docid")]
         return filtered
@@ -279,6 +302,7 @@ def extract_phone_from_url(wa_url: str) -> Optional[str]:
     # fallback: parse query param phone
     try:
         from urllib.parse import urlparse, parse_qs
+
         parts = urlparse(wa_url)
         q = parse_qs(parts.query)
         for k in ("phone", "phoneNumber", "text"):
@@ -292,7 +316,9 @@ def extract_phone_from_url(wa_url: str) -> Optional[str]:
     return None
 
 
-def resolve_cwaxp_with_requests(url: str, cookies: Dict[str, str], headers: Dict[str, str]) -> Optional[str]:
+def resolve_cwaxp_with_requests(
+    url: str, cookies: Dict[str, str], headers: Dict[str, str]
+) -> Optional[str]:
     """Fallback resolver using Python requests (no redirects)."""
     try:
         s = requests.Session()
@@ -333,7 +359,9 @@ def process_url(driver, url: str, wait_for_login_flag: bool = True) -> List[Dict
     # parse expected count from __NEXT_DATA__
     expected = parse_nextdocid_count_from_page(driver)
     if expected <= 0:
-        logger.warning("Could not parse expected docid count from page (nextdocid). Will use best-effort stopping.")
+        logger.warning(
+            "Could not parse expected docid count from page (nextdocid). Will use best-effort stopping."
+        )
     else:
         logger.info("Found expected docid count = %d", expected)
 
@@ -351,8 +379,13 @@ def process_url(driver, url: str, wait_for_login_flag: bool = True) -> List[Dict
         time.sleep(SCROLL_PAUSE)
 
         collected = get_collected_pairs(driver)
-        uniq_count = len({p['docid'] for p in collected})
-        logger.info("Scroll %d: collected %d unique pairs (expected %s)", i + 1, uniq_count, expected or "unknown")
+        uniq_count = len({p["docid"] for p in collected})
+        logger.info(
+            "Scroll %d: collected %d unique pairs (expected %s)",
+            i + 1,
+            uniq_count,
+            expected or "unknown",
+        )
 
         if expected and uniq_count >= expected:
             logger.info("Collected expected number of docids; stopping scroll.")
@@ -373,7 +406,11 @@ def process_url(driver, url: str, wait_for_login_flag: bool = True) -> List[Dict
     # resolve each cwaxp url to whatsapp url and extract number
     results = []
     cookies = driver_cookies_to_dict(driver)
-    headers = {"User-Agent": USER_AGENT, "Referer": url, "Origin": "https://www.justdial.com"}
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Referer": url,
+        "Origin": "https://www.justdial.com",
+    }
 
     idx = 0
     for docid, scd in dedup.items():
@@ -398,14 +435,11 @@ def get_product_details(driver, doc_id):
     anchor_tag = product.find_element(By.TAG_NAME, "a")
     title = anchor_tag.get_attribute("title")
     url = anchor_tag.get_attribute("href")
-    ratings = product.find_element(By.CSS_SELECTOR, "li[class*='resultbox_totalrate']").text
+    ratings = product.find_element(
+        By.CSS_SELECTOR, "li[class*='resultbox_totalrate']"
+    ).text
     address = product.find_element(By.TAG_NAME, "address").text
-    return {
-        "title": title,
-        "url": url,
-        "ratings": ratings,
-        "address": address
-    }
+    return {"title": title, "url": url, "ratings": ratings, "address": address}
 
 
 def save_to_excel(rows, is_partial: bool = False):
